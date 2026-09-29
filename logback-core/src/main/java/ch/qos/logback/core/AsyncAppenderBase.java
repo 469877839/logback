@@ -64,8 +64,9 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
     /**
      * The default maximum queue flush time allowed during appender stop. If the
-     * worker takes longer than this time it will exit, discarding any remaining
-     * items in the queue
+     * flush of the queue takes longer than this time, {@link #stop()} stops
+     * waiting and reports the number of events which had not been delivered
+     * when the timeout expired
      */
     public static final int DEFAULT_MAX_FLUSH_TIME = 1000;
     int maxFlushTime = DEFAULT_MAX_FLUSH_TIME;
@@ -119,6 +120,19 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         worker.start();
     }
 
+    /**
+     * Stops this appender.
+     * <p>
+     * Once stop is initiated, the entry point is sealed: further invocations of
+     * {@link #doAppend(Object)} are rejected. An event is considered "accepted"
+     * once it has been placed in the queue. All accepted events are delivered
+     * to the attached appender by the worker thread before it exits. This
+     * method waits for the flush to complete, up to {@link #maxFlushTime}
+     * milliseconds. If the timeout expires, this method stops waiting and
+     * reports how many events had not been delivered at that point. Events
+     * offered by threads racing with stop, too late to be seen by the worker's
+     * final drain, cannot be delivered; their number is reported as well.
+     */
     @Override
     public void stop() {
         if (!isStarted())
@@ -128,6 +142,8 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         // if it is invoking
         // aii.appendLoopOnAppenders
         // and sub-appenders consume the interruption
+        // marking this appender as stopped also seals the entry point: events
+        // arriving from now on are rejected by doAppend
         super.stop();
 
         // interrupt the worker thread so that it can terminate. Note that the
@@ -143,10 +159,17 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
             // check to see if the thread ended and if not add a warning message
             if (worker.isAlive()) {
-                addWarn("Max queue flush timeout (" + maxFlushTime + " ms) exceeded. Approximately "
-                        + blockingQueue.size() + " queued events were possibly discarded.");
+                int remaining = blockingQueue.size();
+                addWarn("Max queue flush timeout (" + maxFlushTime + " ms) exceeded. " + remaining
+                        + " queued events had not been delivered when the timeout expired.");
             } else {
-                addInfo("Queue flush finished successfully within timeout.");
+                int remaining = blockingQueue.size();
+                if (remaining == 0) {
+                    addInfo("Queue flush finished successfully within timeout.");
+                } else {
+                    addWarn("Worker thread terminated with " + remaining
+                            + " events still pending in the queue. These events, offered concurrently with stop, will be discarded.");
+                }
             }
 
         } catch (InterruptedException e) {
@@ -309,9 +332,16 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
             addInfo("Worker thread will flush remaining events before exiting. ");
 
-            for (E e : parent.blockingQueue) {
+            // Atomically drain the events remaining in the queue. Since the
+            // parent is already marked as stopped, no new events are accepted
+            // beyond this point, so a single drain cannot turn into an
+            // endless loop, even if a sub-appender logs while being flushed.
+            // Events offered concurrently with stop, too late to be included
+            // in this drain, are reported and discarded by stop().
+            List<E> remaining = new ArrayList<E>();
+            parent.blockingQueue.drainTo(remaining);
+            for (E e : remaining) {
                 aai.appendLoopOnAppenders(e);
-                parent.blockingQueue.remove(e);
             }
 
             aai.detachAndStopAllAppenders();

@@ -22,6 +22,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * This appender and derived classes, log events asynchronously. In order to
@@ -59,6 +60,13 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
     static final int UNDEFINED = -1;
     int discardingThreshold = UNDEFINED;
     boolean neverBlock = false;
+
+    /**
+     * Number of {@link #doAppend(Object)} invocations currently in flight.
+     * Consulted by the worker thread while flushing during stop, in order to
+     * decide when no more events can be added to the queue.
+     */
+    final AtomicInteger inFlightAppends = new AtomicInteger(0);
 
     Worker worker = new Worker();
 
@@ -143,8 +151,9 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
             // check to see if the thread ended and if not add a warning message
             if (worker.isAlive()) {
-                addWarn("Max queue flush timeout (" + maxFlushTime + " ms) exceeded. Approximately "
-                        + blockingQueue.size() + " queued events were possibly discarded.");
+                int remaining = blockingQueue.size();
+                addWarn("Max queue flush timeout (" + maxFlushTime + " ms) exceeded. " + remaining
+                        + " queued events could not be flushed in time. The worker thread will continue flushing them in the background.");
             } else {
                 addInfo("Queue flush finished successfully within timeout.");
             }
@@ -164,6 +173,26 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
         }
         preprocess(eventObject);
         put(eventObject);
+    }
+
+    /**
+     * An event is considered accepted by this appender once this method
+     * observes the appender as started. In-flight invocations are counted
+     * <em>before</em> the started-check performed in
+     * {@link UnsynchronizedAppenderBase#doAppend(Object)}, so that during stop
+     * the worker thread can wait for events which passed the check but have
+     * not been enqueued yet. Events arriving after the appender is marked as
+     * stopped are rejected by the started-check in the super class and are
+     * therefore never accepted.
+     */
+    @Override
+    public void doAppend(E eventObject) {
+        inFlightAppends.incrementAndGet();
+        try {
+            super.doAppend(eventObject);
+        } finally {
+            inFlightAppends.decrementAndGet();
+        }
     }
 
     public boolean isQueueBelowDiscardingThreshold() {
@@ -309,12 +338,51 @@ public class AsyncAppenderBase<E> extends UnsynchronizedAppenderBase<E> implemen
 
             addInfo("Worker thread will flush remaining events before exiting. ");
 
-            for (E e : parent.blockingQueue) {
-                aai.appendLoopOnAppenders(e);
-                parent.blockingQueue.remove(e);
-            }
+            // The interruption that made this thread exit the loop above may
+            // still be reflected in the interrupt status. Clear it so that it
+            // does not interfere with the flushing below.
+            Thread.interrupted();
+
+            parent.flushRemainingEvents(aai);
 
             aai.detachAndStopAllAppenders();
+        }
+    }
+
+    /**
+     * Flush the events remaining in the queue. Called by the worker thread
+     * after its main loop has exited, i.e. after this appender was marked as
+     * stopped.
+     * <p>
+     * In addition to events already queued, events of in-flight
+     * {@link #doAppend(Object)} invocations are waited for and flushed as
+     * well: such invocations entered before the appender was marked as
+     * stopped and may not have enqueued their event yet. No lock is held
+     * while invoking the attached appenders, so logging performed by the
+     * attached appenders themselves (which may be routed back to this
+     * appender, where it is rejected by the not-started check) cannot
+     * deadlock the flush.
+     */
+    private void flushRemainingEvents(AppenderAttachableImpl<E> aai) {
+        while (true) {
+            E e = blockingQueue.poll();
+            if (e != null) {
+                aai.appendLoopOnAppenders(e);
+                continue;
+            }
+            // The queue is empty. An in-flight doAppend() invocation may still
+            // enqueue an event, so flushing is only complete once no such
+            // invocation remains. The queue is polled a second time to catch
+            // events enqueued between the first poll and the in-flight check.
+            if (inFlightAppends.get() == 0 && blockingQueue.poll() == null) {
+                return;
+            }
+            try {
+                Thread.sleep(1);
+            } catch (InterruptedException ie) {
+                // Interruption must not cause remaining events to be
+                // abandoned. Keep flushing.
+            }
         }
     }
 }
